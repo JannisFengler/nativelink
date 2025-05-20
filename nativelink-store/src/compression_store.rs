@@ -525,14 +525,15 @@ impl StoreDriver for CompressionStore {
                             start_pos + remaining_bytes_to_send as usize,
                             uncompressed_chunk_sz,
                         );
-                        if end_pos != start_pos {
+                        if end_pos > start_pos {
                             // Make sure we don't send an EOF by accident.
                             writer
                                 .send(uncompressed_data.freeze().slice(start_pos..end_pos))
                                 .await
                                 .err_tip(|| "Failed sending chunk in compression store")?;
+
+                            remaining_bytes_to_send -= (end_pos - start_pos) as u64;
                         }
-                        remaining_bytes_to_send -= (end_pos - start_pos) as u64;
                     }
                     uncompressed_data_sz = new_uncompressed_data_sz;
                 }
