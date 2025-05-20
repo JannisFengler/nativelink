@@ -510,3 +510,65 @@ async fn get_part_is_zero_digest() -> Result<(), Error> {
 
     Ok(())
 }
+#[nativelink_test]
+async fn skip_chunk_no_panic_test() -> Result<(), Error> {
+    use bytes::Buf;
+    const BLOCK_SIZE: u32 = DEFAULT_BLOCK_SIZE;
+
+    // Create store and insert some data that spans multiple chunks.
+    let inner_store = MemoryStore::new(&MemorySpec::default());
+    let store_owned = CompressionStore::new(
+        &CompressionSpec {
+            backend: StoreSpec::Memory(MemorySpec::default()),
+            compression_algorithm: nativelink_config::stores::CompressionAlgorithm::Lz4(
+                nativelink_config::stores::Lz4Config::default(),
+            ),
+        },
+        Store::new(inner_store.clone()),
+    )
+    .err_tip(|| "Failed to create compression store")?;
+    let store = Pin::new(&store_owned);
+
+    let mut value = vec![0u8; (BLOCK_SIZE as usize) * 2 + 10];
+    let mut rng = SmallRng::seed_from_u64(1);
+    rng.fill(&mut value[..]);
+
+    let digest = DigestInfo::try_new(VALID_HASH, DUMMY_DATA_SIZE).unwrap();
+    store.update_oneshot(digest, value.clone().into()).await?;
+
+    // Get compressed data from inner store.
+    let mut compressed_data = Pin::new(inner_store.as_ref())
+        .get_part_unchunked(digest, 0, None)
+        .await?;
+
+    // Locate the footer frame.
+    let mut pos = compressed_data.len() - 1; // Skip version
+    pos -= 4; // block_size
+    pos -= 8; // uncompressed_data_size
+    let index_count = u32::from_le_bytes(compressed_data[pos - 4..pos].try_into().unwrap());
+    pos -= 4; // index_count
+    pos -= (index_count * 4) as usize; // indexes
+    pos -= 8; // bincode_index_count
+    let footer_len = u32::from_le_bytes(compressed_data[pos - 4..pos].try_into().unwrap());
+    let footer_start = pos - 5; // frame_type + footer_len
+
+    // Insert a zero-length chunk before the footer to simulate a skipped block.
+    let mut corrupted = Vec::new();
+    corrupted.extend_from_slice(&compressed_data[..footer_start]);
+    corrupted.push(CHUNK_FRAME_TYPE);
+    corrupted.extend_from_slice(&0u32.to_le_bytes());
+    corrupted.extend_from_slice(&compressed_data[footer_start..]);
+
+    inner_store.remove_entry(digest).await;
+    inner_store
+        .update_oneshot(digest, corrupted.into())
+        .await?;
+
+    // Try to read starting from the second block. The stream is corrupted but
+    // should not cause a panic.
+    let res = store
+        .get_part_unchunked(digest, BLOCK_SIZE as u64, Some(1))
+        .await;
+    assert!(res.is_err(), "Expected corrupted stream to return an error");
+    Ok(())
+}
